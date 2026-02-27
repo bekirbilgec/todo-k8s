@@ -1,0 +1,16 @@
+services:
+  api:
+    build: ./api
+    container_name: todo-api
+    ports:
+      - "3000:3000"
+    environment:
+      - LOG_LEVEL=info
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    container_name: todo-web
+    ports:
+      - "8080:80"
+    restart: unless-stopped
