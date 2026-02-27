@@ -4,3 +4,4 @@ metadata:
   name: todo-demo
   labels:
     app.kubernetes.io/name: todo
+    app.kubernetes.io/part-of: todo-demo
