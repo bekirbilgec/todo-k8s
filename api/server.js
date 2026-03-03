@@ -1,3 +1,4 @@
+\
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -6,6 +7,7 @@ const pinoHttp = require("pino-http");
 const swaggerUi = require("swagger-ui-express");
 const { z } = require("zod");
 const crypto = require("crypto");
+const { Pool } = require("pg");
 
 const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -41,18 +43,6 @@ app.use(
   })
 );
 
-// In-memory store
-let todos = [
-  {
-    id: 1,
-    text: "İlk todo",
-    done: false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-];
-let nextId = 2;
-
 // Helpers
 function apiError(res, status, code, message, details) {
   return res.status(status).json({
@@ -67,12 +57,6 @@ function parseBool(v) {
   return null;
 }
 
-function sortTodos(items, sort, order) {
-  const dir = order === "desc" ? -1 : 1;
-  const key = sort === "updatedAt" ? "updatedAt" : sort === "createdAt" ? "createdAt" : "id";
-  return items.slice().sort((a, b) => (a[key] > b[key] ? 1 * dir : a[key] < b[key] ? -1 * dir : 0));
-}
-
 // Validation
 const TodoCreateSchema = z.object({
   text: z.string().trim().min(1).max(200),
@@ -83,25 +67,72 @@ const TodoPutSchema = z.object({
   done: z.boolean(),
 });
 
-const TodoPatchSchema = z.object({
-  text: z.string().trim().min(1).max(200).optional(),
-  done: z.boolean().optional(),
-}).refine((v) => v.text !== undefined || v.done !== undefined, {
-  message: "At least one field required",
-});
+const TodoPatchSchema = z
+  .object({
+    text: z.string().trim().min(1).max(200).optional(),
+    done: z.boolean().optional(),
+  })
+  .refine((v) => v.text !== undefined || v.done !== undefined, {
+    message: "At least one field required",
+  });
 
 const BulkCreateSchema = z.object({
   items: z.array(TodoCreateSchema).min(1).max(100),
 });
 
+// PostgreSQL
+if (!process.env.DATABASE_URL) {
+  logger.warn("DATABASE_URL is not set. API will fail until it is provided.");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl:
+    process.env.PGSSLMODE === "require"
+      ? { rejectUnauthorized: false }
+      : false,
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS todos (
+      id BIGSERIAL PRIMARY KEY,
+      text VARCHAR(200) NOT NULL,
+      done BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_todos_updated_at ON todos(updated_at);`
+  );
+}
+
+function mapTodo(row) {
+  return {
+    id: Number(row.id),
+    text: row.text,
+    done: row.done,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 // Health endpoints
 app.get("/healthz", (_, res) => res.status(200).send("ok"));
-app.get("/readyz", (_, res) => res.status(200).send("ready"));
+app.get("/readyz", async (_, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.status(200).send("ready");
+  } catch (e) {
+    res.status(503).send("not-ready");
+  }
+});
 
 // OpenAPI
 const openapi = {
   openapi: "3.0.3",
-  info: { title: "Todo API", version: "1.1.0" },
+  info: { title: "Todo API", version: "1.2.0" },
   servers: [{ url: "/" }],
   paths: {
     "/v1/todos": {
@@ -138,119 +169,192 @@ app.get("/v1/openapi.json", (_, res) => res.json(openapi));
 app.use("/v1/docs", swaggerUi.serve, swaggerUi.setup(openapi));
 
 // Routes
-app.get("/v1/todos", (req, res) => {
-  let items = todos;
+app.get("/v1/todos", async (req, res) => {
+  try {
+    const q = (req.query.q || "").toString().trim().toLowerCase();
 
-  const q = (req.query.q || "").toString().trim().toLowerCase();
-  if (q) items = items.filter((t) => t.text.toLowerCase().includes(q));
+    const doneRaw = req.query.done?.toString();
+    let doneFilter = null;
+    if (doneRaw !== undefined) {
+      const b = parseBool(doneRaw);
+      if (b === null) return apiError(res, 400, "VALIDATION_ERROR", "done must be true or false");
+      doneFilter = b;
+    }
 
-  const doneRaw = req.query.done?.toString();
-  if (doneRaw !== undefined) {
-    const b = parseBool(doneRaw);
-    if (b === null) return apiError(res, 400, "VALIDATION_ERROR", "done must be true or false");
-    items = items.filter((t) => t.done === b);
+    const sort = (req.query.sort || "createdAt").toString();
+    const order = (req.query.order || "desc").toString().toLowerCase() === "asc" ? "asc" : "desc";
+    const sortCol = sort === "updatedAt" ? "updated_at" : sort === "createdAt" ? "created_at" : "id";
+
+    const limit = Math.min(Number(req.query.limit || 20), 100);
+    const offset = Math.max(Number(req.query.offset || 0), 0);
+
+    const where = [];
+    const params = [];
+    let i = 1;
+
+    if (q) {
+      where.push(`LOWER(text) LIKE $${i++}`);
+      params.push(`%${q}%`);
+    }
+    if (doneFilter !== null) {
+      where.push(`done = $${i++}`);
+      params.push(doneFilter);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const totalR = await pool.query(`SELECT COUNT(*)::bigint AS c FROM todos ${whereSql}`, params);
+    const total = Number(totalR.rows[0].c);
+
+    const listR = await pool.query(
+      `SELECT * FROM todos ${whereSql} ORDER BY ${sortCol} ${order} LIMIT $${i++} OFFSET $${i++}`,
+      [...params, limit, offset]
+    );
+
+    const items = listR.rows.map(mapTodo);
+
+    res.json({
+      items,
+      meta: {
+        total,
+        limit,
+        offset,
+        hasNext: offset + limit < total,
+        hasPrev: offset > 0,
+      },
+    });
+  } catch (err) {
+    req.log.error({ err }, "List todos failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
   }
-
-  const sort = (req.query.sort || "createdAt").toString();
-  const order = (req.query.order || "desc").toString();
-  items = sortTodos(items, sort, order);
-
-  const limit = Math.min(Number(req.query.limit || 20), 100);
-  const offset = Math.max(Number(req.query.offset || 0), 0);
-
-  const page = items.slice(offset, offset + limit);
-
-  res.json({
-    items: page,
-    meta: {
-      total: items.length,
-      limit,
-      offset,
-      hasNext: offset + limit < items.length,
-      hasPrev: offset > 0,
-    },
-  });
 });
 
-app.get("/v1/todos/stats", (_, res) => {
-  const total = todos.length;
-  const done = todos.filter((t) => t.done).length;
-  res.json({ total, done, pending: total - done });
+app.get("/v1/todos/stats", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT
+        COUNT(*)::bigint AS total,
+        SUM(CASE WHEN done THEN 1 ELSE 0 END)::bigint AS done
+      FROM todos
+    `);
+    const total = Number(r.rows[0].total);
+    const done = Number(r.rows[0].done || 0);
+    res.json({ total, done, pending: total - done });
+  } catch (err) {
+    req.log.error({ err }, "Stats failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  }
 });
 
-app.get("/v1/todos/:id", (req, res) => {
-  const id = Number(req.params.id);
-  const t = todos.find((x) => x.id === id);
-  if (!t) return apiError(res, 404, "NOT_FOUND", "Todo not found");
-  res.json(t);
+app.get("/v1/todos/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const r = await pool.query(`SELECT * FROM todos WHERE id = $1`, [id]);
+    if (!r.rows[0]) return apiError(res, 404, "NOT_FOUND", "Todo not found");
+    res.json(mapTodo(r.rows[0]));
+  } catch (err) {
+    req.log.error({ err }, "Get todo failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  }
 });
 
-app.post("/v1/todos", (req, res) => {
+app.post("/v1/todos", async (req, res) => {
   const parsed = TodoCreateSchema.safeParse(req.body);
   if (!parsed.success) return apiError(res, 400, "VALIDATION_ERROR", "Invalid body", parsed.error.flatten());
 
-  const now = new Date().toISOString();
-  const todo = { id: nextId++, text: parsed.data.text, done: false, createdAt: now, updatedAt: now };
-  todos.push(todo);
-
-  res.status(201).json(todo);
+  try {
+    const r = await pool.query(
+      `INSERT INTO todos(text, done) VALUES ($1, false) RETURNING *`,
+      [parsed.data.text]
+    );
+    res.status(201).json(mapTodo(r.rows[0]));
+  } catch (err) {
+    req.log.error({ err }, "Create todo failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  }
 });
 
-app.post("/v1/todos/bulk", (req, res) => {
+app.post("/v1/todos/bulk", async (req, res) => {
   const parsed = BulkCreateSchema.safeParse(req.body);
   if (!parsed.success) return apiError(res, 400, "VALIDATION_ERROR", "Invalid body", parsed.error.flatten());
 
-  const now = new Date().toISOString();
-  const created = parsed.data.items.map((it) => {
-    const todo = { id: nextId++, text: it.text, done: false, createdAt: now, updatedAt: now };
-    todos.push(todo);
-    return todo;
-  });
-
-  res.status(201).json({ items: created });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const created = [];
+    for (const it of parsed.data.items) {
+      const r = await client.query(
+        `INSERT INTO todos(text, done) VALUES ($1, false) RETURNING *`,
+        [it.text]
+      );
+      created.push(mapTodo(r.rows[0]));
+    }
+    await client.query("COMMIT");
+    res.status(201).json({ items: created });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    req.log.error({ err }, "Bulk create failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  } finally {
+    client.release();
+  }
 });
 
-app.put("/v1/todos/:id", (req, res) => {
-  const id = Number(req.params.id);
-  const idx = todos.findIndex((x) => x.id === id);
-  if (idx === -1) return apiError(res, 404, "NOT_FOUND", "Todo not found");
-
+app.put("/v1/todos/:id", async (req, res) => {
   const parsed = TodoPutSchema.safeParse(req.body);
   if (!parsed.success) return apiError(res, 400, "VALIDATION_ERROR", "Invalid body", parsed.error.flatten());
 
-  const now = new Date().toISOString();
-  todos[idx] = {
-    ...todos[idx],
-    text: parsed.data.text,
-    done: parsed.data.done,
-    updatedAt: now,
-  };
-
-  res.json(todos[idx]);
+  try {
+    const id = Number(req.params.id);
+    const r = await pool.query(
+      `UPDATE todos
+       SET text = $1, done = $2, updated_at = now()
+       WHERE id = $3
+       RETURNING *`,
+      [parsed.data.text, parsed.data.done, id]
+    );
+    if (!r.rows[0]) return apiError(res, 404, "NOT_FOUND", "Todo not found");
+    res.json(mapTodo(r.rows[0]));
+  } catch (err) {
+    req.log.error({ err }, "Put todo failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  }
 });
 
-app.patch("/v1/todos/:id", (req, res) => {
-  const id = Number(req.params.id);
-  const t = todos.find((x) => x.id === id);
-  if (!t) return apiError(res, 404, "NOT_FOUND", "Todo not found");
-
+app.patch("/v1/todos/:id", async (req, res) => {
   const parsed = TodoPatchSchema.safeParse(req.body);
   if (!parsed.success) return apiError(res, 400, "VALIDATION_ERROR", "Invalid body", parsed.error.flatten());
 
-  const now = new Date().toISOString();
-  if (parsed.data.text !== undefined) t.text = parsed.data.text;
-  if (parsed.data.done !== undefined) t.done = parsed.data.done;
-  t.updatedAt = now;
+  try {
+    const id = Number(req.params.id);
+    const r = await pool.query(`SELECT * FROM todos WHERE id = $1`, [id]);
+    if (!r.rows[0]) return apiError(res, 404, "NOT_FOUND", "Todo not found");
 
-  res.json(t);
+    const current = r.rows[0];
+    const newText = parsed.data.text !== undefined ? parsed.data.text : current.text;
+    const newDone = parsed.data.done !== undefined ? parsed.data.done : current.done;
+
+    const u = await pool.query(
+      `UPDATE todos SET text = $1, done = $2, updated_at = now() WHERE id = $3 RETURNING *`,
+      [newText, newDone, id]
+    );
+
+    res.json(mapTodo(u.rows[0]));
+  } catch (err) {
+    req.log.error({ err }, "Patch todo failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  }
 });
 
-app.delete("/v1/todos/:id", (req, res) => {
-  const id = Number(req.params.id);
-  const before = todos.length;
-  todos = todos.filter((x) => x.id !== id);
-  if (todos.length === before) return apiError(res, 404, "NOT_FOUND", "Todo not found");
-  res.status(204).send();
+app.delete("/v1/todos/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const r = await pool.query(`DELETE FROM todos WHERE id = $1`, [id]);
+    if (r.rowCount === 0) return apiError(res, 404, "NOT_FOUND", "Todo not found");
+    res.status(204).send();
+  } catch (err) {
+    req.log.error({ err }, "Delete todo failed");
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  }
 });
 
 // 404
@@ -262,7 +366,29 @@ app.use((err, req, res, next) => {
   apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
 });
 
+async function shutdown(signal) {
+  try {
+    logger.info({ signal }, "Shutting down");
+    await pool.end();
+  } catch (e) {
+    logger.error({ err: e }, "Error during shutdown");
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
 const port = Number(process.env.PORT || 3000);
-app.listen(port, "0.0.0.0", () => {
-  logger.info({ port }, "todo-api started");
-});
+
+initDb()
+  .then(() => {
+    app.listen(port, "0.0.0.0", () => {
+      logger.info({ port }, "todo-api started");
+    });
+  })
+  .catch((err) => {
+    logger.error({ err }, "DB init failed");
+    process.exit(1);
+  });

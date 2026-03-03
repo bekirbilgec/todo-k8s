@@ -1,16 +1,54 @@
 services:
+  db:
+    image: postgres:18-alpine
+    container_name: todo_db
+    environment:
+      POSTGRES_DB: todo
+      POSTGRES_USER: todo
+      POSTGRES_PASSWORD: k8sankara*+
+    volumes:
+      - todo_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U todo -d todo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - todo_net
+
   api:
-    build: ./api
-    container_name: todo-api
+    build:
+      context: ./api
+    container_name: todo_api
+    environment:
+      PORT: "3000"
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://todo:k8sankara*+@db:5432/todo
+      PGSSLMODE: disable
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
       - "3000:3000"
-    environment:
-      - LOG_LEVEL=info
+    networks:
+      - todo_net
     restart: unless-stopped
 
   web:
-    build: ./web
-    container_name: todo-web
+    build:
+      context: ./web
+    container_name: todo_web
+    depends_on:
+      - api
     ports:
       - "8080:80"
+    networks:
+      - todo_net
     restart: unless-stopped
+
+volumes:
+  todo_db_data:
+
+networks:
+  todo_net:
+    driver: bridge
